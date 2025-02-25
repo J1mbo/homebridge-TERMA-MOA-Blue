@@ -1,0 +1,55 @@
+WEB SERVER INSTALLATION
+
+The web server should be deployed as closed to the Bluetooth devices as possible (whilst respecting local electrical safety requirements), since range is limited. Raspberry Pi Zero 2W is an ideal platform for this component.
+
+
+1. Install Python and dependencies:
+
+$ sudo apt install python3 python3-fastapi python3-uvicorn python3-bleak python3-pydantic python3-pexpect
+
+
+2. Deploy the web server and configure as a systemd service:
+
+$ sudo mkdir /opt/moa_web_server
+$ sudo cp moa_web_server.py /opt/moa_web_server/
+$ sudo cp moa_web_server.service /etc/systemd/system/
+$ sudo systemctl daemon-reload
+
+
+3. Enable the web server (which will start automatically at boot):
+
+$ sudo systemctl enable moa_web_server.service
+Created symlink /etc/systemd/system/multi-user.target.wants/moa_web_server.service → /etc/systemd/system/moa_web_server.service.
+
+4. Start the web server:
+
+$ sudo systemctl start moa_web_server.service
+$ sudo systemctl status moa_web_server.service
+● moa_web_server.service - TERMA MOA Blue Web Server (port 8080)
+     Loaded: loaded (/etc/systemd/system/moa_web_server.service; enabled; preset: enabled)
+     Active: active (running) since Mon 2025-02-24 08:32:40 GMT; 2s ago
+   Main PID: 6723 (python3)
+      Tasks: 1 (limit: 172)
+        CPU: 2.770s
+     CGroup: /system.slice/moa_web_server.service
+             └─6723 /usr/bin/python3 /opt/moa_web_server/moa_web_server.py
+
+Feb 24 08:32:40 pi-zero systemd[1]: Started moa_web_server.service - TERMA MOA Blue Web Server (port 8080).
+
+
+The web server will automatically return room temperature measured on a DS18B20 sensor if attached (instead of the TERMA's built-in sensor), which can be used to implement better room temperature regulation since this can be mounted higher than the elements are typically cited. To use this feature:
+
+1. Physically install a DS18B20 sensor and position in a suitable location (noting electrical safety requirements for damp locations, for example behind a wall tile) in a location that won't be affected by convected or radiated heat from the towel rail and other heating sources
+2. Connected the DS18B20 sensor to the RPi GPIO header (DS18B20’s VDD pin to 3.3V (Pin1), GND any ground eg Pin9, Data/DQ to Pin4.
+3. Add the required settings /boot/firmware/config.txt:
+
+$ echo "dtoverlay=w1-gpio,gpiopin=4" | sudo tee -a /boot/firmware/config.txt
+
+Then reboot and check the web server is accessible:
+
+http://[ip-address]:8080/discover
+
+
+CHECKING LOGS:
+
+sudo journalctl -u moa_web_service.service

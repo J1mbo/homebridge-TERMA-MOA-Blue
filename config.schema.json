@@ -1,0 +1,50 @@
+{
+  "pluginAlias": "TERMA-MOA-Blue",
+  "pluginType": "accessory",
+  "singular": false,
+  "headerDisplay": "HomeKit control of TERMA's 'MOA Blue' range of bluetooth enabled heated towel rails and elements.",
+  "footerDisplay": "This plugin requires a running moa-web-server somewhere physically close enough to the heating element to control it. See 'INSTALLATION' for instructions covernig how to install this component.",
+  "title": "HomeBridge Thermostat Accessory Config Schema",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "The name to appear in Homekit.",
+        "required": true
+      },
+      "deviceAddress": {
+        "type": "string",
+        "pattern": "^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$",
+        "description": "Bluetooth MAC address of the heater device (e.g. 'CC:22:37:10:43:4B'). This can be found using the web server /discover function.",
+        "required": true
+      },
+      "baseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8080",
+        "description": "The base URL for the moa_web_server used to connect to the device (note: without a trailing /).",
+        "required": true
+      },
+      "drying": {
+        "type": "number",
+        "minimum": 0,
+        "description": "When set to >=30 (°C), heater will be set to this temperature instead of being turned off when no heating is needed to provide towel warming function.",
+        "required": false
+      },
+      "pollInterval": {
+        "type": "number",
+        "default": 300000,
+        "description": "Polling interval in milliseconds (default is 300000 ms - 5 minutes).",
+        "required": false
+      }
+    }
+  },
+  "form": [
+    "name",
+    "deviceAddress",
+    "baseUrl",
+    "drying",
+    "pollInterval"
+  ],
+  "display": null
+}
