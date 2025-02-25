@@ -1,0 +1,34 @@
+{
+  "author": "James Pearce",
+  "bugs": {
+    "url": "https://github.com/J1mbo/homebridge-TERMA-MOA-Blue"
+  },
+  "deprecated": false,
+  "description": "Homebridge plugin to control TERMA's MOA Blue range of bluetooth-enabled towel rail heaters.",
+  "devDependencies": {},
+  "engines": {
+    "homebridge": ">=1.0.0"
+  },
+  "homepage": "https://github.com/J1mbo/homebridge-TERMA-MOA-Blue#readme",
+  "keywords": [
+    "homebridge-plugin",
+    "homebridge",
+    "TERMA",
+    "MOA"
+  ],
+  "license": "MIT",
+  "main": "index.js",
+  "name": "homebridge-TERMA-MOA-Blue",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/J1mbo/homebridge-TERMA-MOA-Blue.git"
+  },
+  "funding": {
+    "type": "paypal",
+    "url": "https://paypal.me/HomebridgeJ1mbo"
+  },
+  "version": "0.0.1",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}

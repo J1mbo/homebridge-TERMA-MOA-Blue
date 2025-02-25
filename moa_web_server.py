@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+import sys
+import re
+import glob
+import os
+import asyncio
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, validator
+from bleak import BleakClient, BleakScanner
+import uvicorn
+
+app = FastAPI()
+
+BANNER = r"""
+########################################################################################################
+#
+# TERMA MOA BLUE WEB INTERFACE, Copyright (C) James Pearce, 2025
+# This program creates a web API for one or more Terma MOA Bluetooth Electric Heating Elements.
+#
+# WARNING:
+#
+# Setting the heating element progmatically can result in eroneous values being set, particularly
+# when switching between modes 5 and 6, which results in target temperatures being doubled. To work
+# around this, this utility always first sets (and confirms) mode 0 (off), then sets (and confirms)
+# the target mode. If the correct values are not reported back after several retries, the device is
+# then set to mode 0 (off). Input values are also clamped within manufacturer provided ranges.
+#
+# DO NOT REMOVE ANY OF THIS PROTECTION AND VALIDATION LOGIC. ALL TOWEL RAILS REQUIRE EXPANSION SPACE
+# TO ACCOMODATE THE EXPANSION OF THEIR CONTENTS WHEN HEATED SUFFICIENT TO ACCOMODATE THE CONTENTS AT
+# THE MAXIMUM POSSIBLE TEMPERATURE.
+#
+# SELF-PROTECTION MECHANISMS OF THE TERMA ELEMENTS ARE NOT MADE PUBLIC AND IT IS ABSOLUTELY POSSIBLE
+# TO CONFIGURE THESE DEVICES TO EXCEED THEIR DESIGN MAXIMUM WATER TEMPERATURE OF 60°C.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+# NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT.
+#
+# THE INTENDED USE OF THE SOFTWARE IS TO PROVIDE THE END-USER WITH EXAMPLE CODE SHOWING METHODS TO
+# INTERFACE WITH THE TERMA "MOA BLUE" RANGE OF BLUETOOTH ENABLED ELECTRIC TOWEL RAIL HEATING ELEMENTS.
+# THE SOFTWARE HAS NOT BEEN TESTED IN ALL POSSIBLE SCENARIOS AND IS NOT A FINISHED PRODUCT IN ITSELF.
+# THE END USER IS RESPONSIBLE FOR TESTING THE COMPLETE SYSTEM AND ALL LIABILITY ARISING FROM ITS USE.
+# BY USING THIS SOFTWARE, YOU ARE ACCEPTING THESE TERMS OF USE.
+#
+########################################################################################################
+"""
+
+HELP = r"""
+TERMA MOA BLUE WEB INTERFACE, Copyright (C) James Pearce, 2025
+This program creates a web API for one or more Terma MOA Bluetooth Electric Heating Elements.
+
+Before elements can be used, they must be connected and trusted as the OS layer and return as their
+device name "MOA Blue TERMA".
+
+Functions provided:
+
+/pair?address=XX:XX:XX:XX:XX:XX&pin=XXXXXX
+  Using bluetoothctl:
+    1. Removes the device with specified MAC address
+    2. Enables scanning until specified MAC address is detected
+    3. Disables scanning
+    3. Connects, trusts, and pairs with the specified MAC address using specified PIN
+
+  This is slow and error prone and this will retry the whole process three times.
+  The device needs to be in pairing mode. For MOA Blue TERMA device, the easiest way
+  to do this is to open the TERMA app on your phone, assuming this is already connected
+  to it. The PIN is usually 123456.
+
+  Returns "success" or "failure".
+
+/status?address=XX:XX:XX:XX:XX:XX
+  Returns device status, for example:
+  {
+    "device": "CC:22:37:10:43:4B",
+    "name": "MOA Blue TERMA",
+    "mode": 5,
+    "room_current_temp": 20.9,
+    "room_target_temp": 20,
+    "heater_current_temp": 42.8,
+    "heater_target_temp": 20,
+    "room_temp_source": "HeatingElement"
+  }
+
+/set?address=XX:XX:XX:XX:XX:XX&mode=Y&temp=ZZ.Z
+  Attempts to set device operating mode and returns the device status as per /status
+  mode can be:
+    5 - Room temperature regulation, as measured by the sensor in the element, 15.0-29.9°C
+    6 - Radiator water(/surface) temperature regulation, 29.9°C to 59.8°C
+    any other value - converted to 0, which is off
+
+/query-device?address=XX:XX:XX:XX:XX:XX
+  Provided for troubleshooting, returns all raw data retrieved from device.
+
+/discover?timeout=XX.X
+  Lists all devices and their associated addresses visible. If timeout is omitted uses 15s.
+
+
+Because the sensor in the element is typically installed at floor level, this can result in low
+readings, for example in buildings with poor floor insulation. To solve this problem and enable more
+stable room temperature regulation across the seasons, the function automatically returns in
+room_current_temp the reading from the first attached Dallas DS18B20 sensor if present.
+
+When a DS18B20 sensor is present and working, room_temp_source will read "DS18B20".
+
+Note that when the heating element is set to room-temperature regulation mode (5), this depends
+ONLY on it's internal sensor. The purpose of the external sensor is to enable a controlling function
+to modulate the heater, for example using mode 6, to achieve better room temperature control and
+hence lower energy consumption.
+
+Note that the calls are slow:
+
+- 5-10 seconds to read values
+- 25-30 seconds to set a value
+- 10-60 seconds to pair
+
+Therefore any controlling function reporting onwards elsewhere, e.g. to HomeKit, should run
+asyncronously initially simply reporting success and subsequently updating HomeKit (in that case)
+with any issues later. Querying and updating the heating element once every 3-5 minutes is probably
+more than enough.
+
+"""
+
+
+# Terma specific UUIDs and temperature encode/decode
+# UUIDs for the Terma MOA Blue characteristics
+# These were reverse‐engineered by home-assistant user ptuk
+# See:
+# https://community.home-assistant.io/t/terma-blue-line-bluetooth-radiators-and-heating-elements/81325/6
+ROOM_TEMP_UUID      = "d97352b1-d19e-11e2-9e96-0800200c9a66"  # For room temperature mode (mode 5)
+HEATER_TEMP_UUID    = "d97352b2-d19e-11e2-9e96-0800200c9a66"  # For heater temperature mode (mode 6)
+OPERATING_MODE_UUID = "d97352b3-d19e-11e2-9e96-0800200c9a66"  # Operating mode (0, 5, or 6)
+
+def decode_temperature(data: bytes) -> (float, float):
+    if len(data) < 4:
+        raise ValueError("Temperature data too short")
+    current = ((data[0] * 255) + data[1]) / 10.0
+    target  = ((data[2] * 255) + data[3]) / 10.0
+    return current, target
+
+def encode_temperature(target: float) -> bytes:
+    """
+    Encode a target temperature (°C) into a 4-byte payload.
+    The protocol expects the first two bytes to be zero and the last two bytes
+    represent target*10.
+    """
+    value = int(round(target * 10))
+    high = value // 255
+    low = value % 255
+    return bytes([0, 0, high, low])
+
+
+
+# Utility to validate a BLE address (e.g., "CC:22:37:10:43:4B")
+def validate_address(addr: str) -> str:
+    parts = addr.split(":")
+    if len(parts) != 6 or not all(len(p) == 2 for p in parts):
+        raise HTTPException(status_code=400, detail="Invalid address format.")
+    return addr.upper()
+
+
+
+# find_device function, supports extended scanning but terminates as soon as requested
+# device is found
+import asyncio
+from bleak import BleakScanner
+
+async def find_device(address: str, timeout: float = 15.0):
+    address = address.lower()
+    found_event = asyncio.Event()
+    found_device = None
+
+    def detection_callback(device, advertisement_data):
+        nonlocal found_device
+        if device.address.lower() == address:
+            found_device = device
+            found_event.set()
+
+    async with BleakScanner(detection_callback=detection_callback) as scanner:
+        try:
+            await asyncio.wait_for(found_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    return found_device
+
+
+# query_device gathers everything from the heating element.
+async def query_device(address: str):
+    """
+    Scans for the BLE device with the given MAC address, pairs (if needed),
+    and returns a dictionary with the device name and all discovered services
+    (each characteristic’s properties and value as hex string if readable).
+    """
+    address = validate_address(address)
+    print(f"Querying device with address: {address}")
+    device = await BleakScanner.find_device_by_address(address, timeout=3.0)
+
+    # If not found, perform a full discovery scan
+    if device is None:
+        print("Device not found via direct lookup, performing full discovery...")
+        device = await find_device(address, timeout=30.0)
+
+    if device is None:
+        raise HTTPException(status_code=404, detail=f"Device with address {address} not found")
+    
+    print(f"Found device: {device.name} ({address})")
+
+    try:
+        async with (BleakClient(device, timeout=10.0) as client):
+            print("Discovering services...")
+            services = client.services
+            service_info = {}
+            for service in services:
+                char_info = {}
+                for char in service.characteristics:
+                    data = {"properties": list(char.properties)}
+                    if "read" in char.properties:
+                        try:
+                            value = await client.read_gatt_char(char.uuid)
+                            data["value"] = value.hex()
+                        except Exception as read_exc:
+                            data["value_error"] = str(read_exc)
+                    else:
+                        data["value"] = None
+                    char_info[char.uuid] = data
+                service_info[service.uuid] = char_info
+        return {
+            "device": address,
+            "name": device.name,
+            "services": service_info
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error connecting to device: {str(e)}")
+
+
+def get_char_value(services: dict, char_uuid: str):
+    """
+    Searches the services dictionary for the given characteristic UUID.
+    Returns the value as bytes (if available) or None.
+    """
+    for svc, chars in services.items():
+        if char_uuid in chars:
+            val_hex = chars[char_uuid].get("value")
+            if val_hex is not None:
+                try:
+                    return bytes.fromhex(val_hex)
+                except Exception:
+                    return None
+    return None
+
+def read_ds18b20_temp():
+    """
+    Reads the temperature from the first available DS18B20 sensor.
+    The sensor must be available under /sys/bus/w1/devices with a folder name starting with '28-'.
+    Returns the temperature in degrees Celsius.
+    """
+    base_dir = '/sys/bus/w1/devices'
+    sensor_folders = glob.glob(os.path.join(base_dir, '28-*'))
+    if not sensor_folders:
+        raise Exception("INFO: No DS18B20 sensor found")
+    sensor_folder = sensor_folders[0]
+    sensor_file = os.path.join(sensor_folder, 'w1_slave')
+    
+    try:
+        with open(sensor_file, 'r') as f:
+            lines = f.readlines()
+    except Exception as e:
+        raise Exception(f"Error reading DS18B20 sensor file: {str(e)}")
+    
+    # Check if the sensor output is valid
+    if lines[0].strip()[-3:] != "YES":
+        raise Exception("DS18B20 sensor not ready")
+    
+    equals_pos = lines[1].find('t=')
+    if equals_pos == -1:
+        raise Exception("Temperature reading not found in sensor output")
+    
+    temp_string = lines[1][equals_pos+2:]
+    try:
+        temp_c = float(temp_string) / 1000.0
+    except ValueError:
+        raise Exception("Invalid temperature format from DS18B20")
+    
+    return temp_c
+
+async def read_status(address: str):
+    """
+    Uses query_device to retrieve the full device dump,
+    and then extracts measurement values from the known UUIDs.
+    The local DS18B20 sensor is used to read the current room temperature if available;
+    otherwise, the room temperature is taken from the remote heating element sensor.
+    A field 'room_temp_source' is added to indicate the source.
+    """
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            query = await query_device(address)
+            break  # If successful, exit the loop.
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                print(f"Attempt {attempt + 1} failed: {e}. Retrying...")
+                # Optionally add a delay between retries
+                await asyncio.sleep(3)
+            else:
+                # On the final attempt, re-raise the exception
+                raise Exception(f"All {max_attempts} attempts failed: {e}")
+
+    services = query.get("services", {})
+    
+    # Get the values for the measurement characteristics.
+    room_data = get_char_value(services, ROOM_TEMP_UUID)
+    heater_data = get_char_value(services, HEATER_TEMP_UUID)
+    mode_data   = get_char_value(services, OPERATING_MODE_UUID)
+    
+    if room_data is None or heater_data is None or mode_data is None:
+        raise Exception("Missing measurement data in device services")
+    
+    # Try reading the DS18B20 sensor first.
+    try:
+        room_current = read_ds18b20_temp()
+        room_temp_source = "DS18B20"
+    except Exception:
+        # If the DS18B20 sensor is not available or fails, use the remote sensor value.
+        try:
+            room_current, _ = decode_temperature(room_data)
+        except Exception as e:
+            raise Exception(f"Error decoding current room temperature: {str(e)}")
+        room_temp_source = "HeatingElement"
+    
+    try:
+        # Decode remote room target temperature. underscore ignores first element of tuple
+        _, room_target = decode_temperature(room_data)
+        heater_current, heater_target = decode_temperature(heater_data)
+    except Exception as exc:
+        raise Exception(f"Error decoding room target temperature: {str(exc)}")
+    
+    mode = mode_data[0] if len(mode_data) >= 1 else None
+    return {
+        "device": address,
+        "name": query.get("name"),
+        "mode": mode,
+        "room_current_temp": room_current,
+        "room_target_temp": room_target,
+        "heater_current_temp": heater_current,
+        "heater_target_temp": heater_target,
+        "room_temp_source": room_temp_source
+        # "services": query.get("services")  # optionally include all service data
+    }
+
+
+class SetRequest(BaseModel):
+    mode: int         # Allowed values: 0 (off), 5 (manual room mode), or 6 (manual heater mode)
+    target_temp: float  # Desired target temperature in ºC
+
+    @validator("mode")
+    def validate_mode(cls, v):
+        if v not in [0, 5, 6]:
+            raise ValueError("Invalid mode; must be 0, 5, or 6")
+        return v
+
+    @validator("target_temp", pre=True)
+    def clamp_target_temp(cls, v, values):
+        mode = values.get("mode")
+        try:
+            val = float(v)
+        except Exception:
+            raise ValueError("target_temp must be a number")
+        if mode == 5:
+            # For room mode, valid reported range is 15.0 – 29.9 ºC.
+            if val < 15.0:
+                print(f"Clamping room temperature {val}°C to 15.0°C")
+                return 15.0
+            elif val > 29.9:
+                print(f"Clamping room temperature {val}°C to 29.9°C")
+                return 29.9
+        elif mode == 6:
+            # For heater mode, valid reported range is 29.9 – 59.8 ºC.
+            if val < 29.9:
+                print(f"Clamping heater temperature {val}°C to 29.9°C")
+                return 29.9
+            elif val > 59.8:
+                print(f"Clamping heater temperature {val}°C to 59.8°C")
+                return 59.8
+        return val
+
+async def retry_read_status(address: str, retries: int = 5, delay: float = 5.0, timeout: float = 5.0):
+    last_error = None
+    for i in range(retries):
+        try:
+            print(f"Attempting to read status for {address} (timeout={timeout} sec), try {i+1} of {retries}...")
+            result = await asyncio.wait_for(read_status(address), timeout=timeout)
+            print("Status read successfully.")
+            return result
+        except Exception as e:
+            last_error = e
+            print(f"Retry {i+1}/{retries} failed: {repr(e)}")
+            await asyncio.sleep(delay)
+    raise last_error
+
+@app.get("/status")
+async def get_status(address: str = Query(..., description="BLE address, e.g., CC:22:37:10:43:4B")):
+    print(f"Received /status command for device: {address}")
+    try:
+        return await read_status(address)
+    except Exception as e:
+        print(f"/status command failed: {repr(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/query-device")
+async def query_device_endpoint(address: str = Query(..., description="BLE address, e.g., CC:22:37:10:43:4B")):
+    """
+    Scans for the device with the provided address, pairs with it if needed,
+    and returns all discovered service/characteristic information.
+    """
+    print(f"Received /query-device command for address: {address}")
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            query = await query_device(address)
+            break  # If successful, exit the loop.
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                print(f"Attempt {attempt + 1} failed: {e}. Retrying...")
+                # Optionally add a delay between retries
+                await asyncio.sleep(3)
+            else:
+                # On the final attempt, re-raise the exception
+                raise Exception(f"All {max_attempts} attempts failed: {e}")
+    return query
+
+
+async def set_thermostat(address: str, req: SetRequest):
+    """
+    Attempts to set the device to the requested mode and target temperature.
+    Checks the status after writing and repeats the process up to 3 times.
+    If the expected value is not set after 3 attempts, sets the device to mode 0 (off).
+    """
+    expected_mode = req.mode
+    # For mode 5, we check room_target_temp; for mode 6, we check heater_target_temp.
+    # Any other value will set to mode 0 (off)
+    expected_target = req.target_temp
+    max_attempts = 3
+    attempt = 0
+
+    while attempt < max_attempts:
+        print(f"Attempt {attempt+1}: Received set command: mode={req.mode}, target_temp={req.target_temp}")
+        address = validate_address(address)
+        print(f"Querying device with address: {address}")
+        device = await BleakScanner.find_device_by_address(address, timeout=5.0)
+
+        # If not found, perform a full discovery scan
+        if device is None:
+            print("Device not found via direct lookup, performing full discovery...")
+            devices = await BleakScanner.discover(timeout=15.0)
+            device = next((d for d in devices if d.address.lower() == address.lower()), None)
+        if device is None:
+            raise HTTPException(status_code=404, detail=f"Device with address {address} not found")
+        print(f"Found device: {device.name} ({address})")
+
+        try:
+            async with BleakClient(device, timeout=10.0) as client:
+#                print("Pairing with device...")
+#                # Pair without a PIN code.
+#                paired = await client.pair(protection_level=2)
+#                if not paired:
+#                    print("Pairing unsuccessful.")
+#                else:
+#                    print("Discovering services...")
+                services = client.services
+                if req.mode == 5:
+                    temp_uuid = ROOM_TEMP_UUID
+                elif req.mode == 6:
+                    temp_uuid = HEATER_TEMP_UUID
+                else:
+                    temp_uuid = None
+
+                if temp_uuid is None:
+                    print("Clearing current config (setting device to mode 0=off)")
+                    async with BleakClient(device, timeout=10.0) as client:
+                        try:
+                            await client.write_gatt_char(OPERATING_MODE_UUID, bytes([0]), response=False)
+                            print("Device set to mode 0 (off).")
+                        except Exception as e:
+                            print(f"Could not set device to off: {e}")
+                            temp_uuid = None
+                else:
+                    payload = encode_temperature(req.target_temp)
+                    print(f"Attempt {attempt+1}: Writing temperature payload {payload.hex()} to characteristic {temp_uuid}")
+                    try:
+                        await client.write_gatt_char(temp_uuid, payload, response=False)
+                    except Exception as e:
+                        raise Exception(f"Attempt {attempt+1}: Failed to write target temperature: {e}")
+
+                    mode_payload = bytes([req.mode])
+                    print(f"Attempt {attempt+1}: Writing operating mode {mode_payload.hex()} to {OPERATING_MODE_UUID}")
+                    try:
+                        await client.write_gatt_char(OPERATING_MODE_UUID, mode_payload, response=False)
+                    except Exception as e:
+                        print(f"Attempt {attempt+1}: Failed to write operating mode: {e}")
+
+        except Exception as e:
+            print(f"Attempt {attempt+1}: Device connection failed: {e}")
+
+        print(f"Attempt {attempt+1}: Write commands completed, waiting for device to re-advertise...")
+        await asyncio.sleep(3)
+
+        print(f"Attempt {attempt+1}: Reading status after set command...")
+        try:
+            status = await read_status(address)
+        except Exception as e:
+            print(f"Attempt {attempt+1}: Failed to read status: {e}")
+            status = None
+
+        if status is not None:
+            if req.mode == 5:
+                actual = status.get("room_target_temp", 0)
+                if abs(actual - expected_target) < 0.5:
+                    print(f"Attempt {attempt+1}: Status verified for mode 5: {actual}°C (expected {expected_target}°C)")
+                    return status
+                else:
+                    print(f"Attempt {attempt+1}: room_target_temp {actual}°C != expected {expected_target}°C")
+            elif req.mode == 6:
+                actual = status.get("heater_target_temp", 0)
+                if abs(actual - expected_target) < 0.5:
+                    print(f"Attempt {attempt+1}: Status verified for mode 6: {actual}°C (expected {expected_target}°C)")
+                    return status
+                else:
+                    print(f"Attempt {attempt+1}: heater_target_temp {actual}°C != expected {expected_target}°C")
+            else:
+                if status.get("mode") == 0:
+                    print(f"Attempt {attempt+1}: Status verified as mode 0 (off)")
+                    return status
+                else:
+                    print(f"Attempt {attempt+1}: reported mode ({actual}) != expected (0)")
+        print(f"Retrying set command (attempt {attempt+1}/{max_attempts})...")
+        attempt += 1
+
+    # If after 3 attempts the expected value is not reached, set device to off (mode 0).
+    print("Failed to set expected values after 3 attempts. Setting device to mode 0 (off).")
+    async with BleakClient(device, timeout=10.0) as client:
+        try:
+            await client.write_gatt_char(OPERATING_MODE_UUID, bytes([0]), response=False)
+            print("Device set to mode 0 (off).")
+        except Exception as e:
+            print(f"Failed to set device to off: {e}")
+    return {"mode": 0, "error": "Failed to set expected values after 3 attempts; device turned off."}
+
+
+
+@app.get("/set")
+async def set_thermostat_get(address: str = Query(..., description="BLE address, e.g., CC:22:37:10:43:4B"),
+                             mode: int = Query(0, description="Mode: 0, 5, or 6"),
+                             temp: float = Query(20.0, description="Target temperature in ºC")):
+    # will accept mode = 5 (room temp), mode = 6 (radiator surface temp)
+    # any other value of mode will turn device off
+    print(f"Received GET /set command for device: {address} with mode={mode}, temp={temp}")
+
+    # First, clear device config (set to off basically)
+    try:
+        req = SetRequest(mode=0, target_temp=20.0)
+        result = await set_thermostat(address, req)
+        print("GET /set command completed")
+    except Exception as e:
+        print(f"GET /set command failed: {repr(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # next, if user has requested mode 5 (room) or 6 (heater surface), attempt to set that
+    if mode == 5 or mode == 6:
+        try:
+            req = SetRequest(mode=mode, target_temp=temp)
+            result = await set_thermostat(address, req)
+            print("GET /set command completed")
+            return result
+        except Exception as e:
+            print(f"GET /set command failed: {repr(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        return result
+
+
+@app.get("/discover")
+async def find_all_devices(timeout: float = 15.0):
+    """
+    Returns a list of dictionaries for all visible Bluetooth devices,
+    where each dictionary contains the device address and device name.
+    """
+    print(f"Received GET /discover command with timeout={timeout}")
+    devices = await BleakScanner.discover(timeout=timeout)
+    return [{"address": device.address, "name": device.name} for device in devices]
+
+
+#########################################################################
+# BLUETOOTH PAIRING FUNCTION. This uses bluetoothctl
+
+import pexpect
+import time
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s [%(levelname)s] %(message)s')
+
+def send_command(child, command, expected_pattern, timeout=2, retries=3):
+    """
+    Sends a command to the child process and waits for an expected output.
+    Retries the command if it fails within the given timeout.
+
+    Returns True if the expected output is detected; otherwise, False.
+    """
+    for attempt in range(1, retries + 1):
+        logging.info(f"Sending command: {command} (attempt {attempt})")
+        child.sendline(command)
+        try:
+            child.expect(expected_pattern, timeout=timeout)
+            logging.info(f"Expected output received for command: {command}")
+            return True
+        except pexpect.TIMEOUT:
+            logging.warning(f"Timeout waiting for '{expected_pattern}' after command: {command}")
+            if attempt < retries:
+                logging.info("Retrying command...")
+            else:
+                logging.error(f"Failed after {retries} attempts: {command}")
+    return False
+
+@app.get("/pair")
+async def pair_device(address: str = Query(..., description="BLE address, e.g., CC:22:37:10:43:4B"),
+                      pin: str = Query("123456", description="Device connect PIN")):
+    """
+    Uses bluetoothctl via pexpect to trust and pair with a device.
+    If any step fails, the entire process sleeps for 3 seconds and retries from the start.
+    
+    Args:
+      address (str): The device MAC address.
+      pin (str): The PIN/passkey to supply when prompted.
+    """
+    print(f"Received GET /pair command for device: {address} with pin={pin}")
+    address = validate_address(address)
+    max_overall_retries = 3
+    for overall_attempt in range(1, max_overall_retries + 1):
+        logging.info(f"Overall pairing attempt {overall_attempt} for device {address}")
+        child = pexpect.spawn("bluetoothctl", encoding="utf-8", timeout=5)
+        child.logfile = sys.stdout  # Print all output to console
+
+        try:
+            # Wait for initial prompt.
+            if not send_command(child, "", re.compile(r'\[bluetooth\]'), timeout=5):
+                raise Exception("Initial prompt not received")
+            
+            # Remove device if it exists.
+            child.sendline(f"remove {address}")
+            if not send_command(child, "", re.compile(r'\[bluetooth\]'), timeout=5):
+                raise Exception("After remove command")
+            
+            # Set agent and default agent.
+            if not send_command(child, "agent KeyboardOnly", re.compile(r'\[bluetooth\]'), timeout=5):
+                raise Exception("Agent command failed")
+            if not send_command(child, "default-agent", re.compile(r"Default agent request successful"), timeout=2):
+                raise Exception("Default agent command failed")
+            
+            # Turn on radio.
+            if not send_command(child, "power on", re.compile(r'\[bluetooth\]'), timeout=5):
+                raise Exception("Power on command failed")
+            
+            # Start scanning.
+            logging.info("Starting scan...")
+            child.sendline("scan on")
+            try:
+                child.expect(f"{address}", timeout=30)
+                logging.info(f"Device {address} detected during scan.")
+            except pexpect.TIMEOUT:
+                raise Exception(f"Timeout waiting for {address} to appear in list.")
+            
+#            # Stop scanning.
+#            logging.info("Stopping scan...")
+#            child.sendline("scan off")
+#            try:
+#                child.expect(f"Discovering: no", timeout=2)
+#                logging.info("Scanning stopped.")
+#            except pexpect.TIMEOUT:
+#                raise Exception("Scanning could not be stopped.")
+
+            # Briefly wait for BlueZ to clean-up
+            time.sleep(2)
+
+            # Connect to the device with retries.
+            logging.info(f"Connecting to device {address}...")
+            max_connect_retries = 3
+            connection_successful = False
+            for attempt in range(1, max_connect_retries + 1):
+                child.sendline(f"connect {address}")
+                try:
+                    child.expect("Connection successful", timeout=5)
+                    logging.info("Connection successful received.")
+                    child.expect(f"{address} ServicesResolved: yes", timeout=15)
+                    logging.info("Services confirmed.")
+                    connection_successful = True
+                    break
+                except pexpect.TIMEOUT:
+                    logging.warning("No response after connect command. Retrying connect...")
+            if not connection_successful:
+                raise Exception("Failed to connect after multiple attempts.")
+            
+            time.sleep(1)
+            # Trust the device.
+            if not send_command(child, f"trust {address}", re.compile(r"trust succeeded"), timeout=2):
+                raise Exception("Trust command failed")
+            
+            time.sleep(1)
+            # Initiate pairing.
+            logging.info(f"Pairing with device {address}...")
+            child.sendline(f"pair {address}")
+            try:
+                index = child.expect([
+                    re.compile(r"Enter passkey"),
+                    re.compile(r"Request passkey"),
+                    re.compile(r"Pairing successful"),
+                    pexpect.TIMEOUT
+                ], timeout=3)
+                if index in [0, 1]:
+                    logging.info(f"Passkey prompt detected. Sending PIN: {pin}")
+                    child.sendline(pin)
+                    child.expect("Pairing successful", timeout=5)
+                    logging.info("Pairing successful!")
+                elif index == 2:
+                    logging.info("Pairing successful (no passkey prompt).")
+                else:
+                    raise Exception("Pairing failed: unexpected response or timeout.")
+            except pexpect.TIMEOUT:
+                raise Exception("Pairing failed: operation timed out.")
+            
+            logging.info("Device paired successfully!")
+
+            # Power-cycle radio. Otherwise, subsequent calls to other functions fail to find the device.
+            # Turn off radio.
+            if not send_command(child, "power off", re.compile(r'\[bluetooth\]'), timeout=5):
+                raise Exception("Power off command failed")
+
+            # Turn on radio.
+            if not send_command(child, "power on", re.compile(r'\[bluetooth\]'), timeout=5):
+                raise Exception("Power on command failed")
+
+            # Exit bluetoothctl
+            time.sleep(1)
+            logging.info("Exiting bluetoothctl...")
+            child.sendline("exit")
+            child.close()
+
+            return {"pairing": "success"} # Exit if all steps succeed.
+
+        except Exception as e:
+            logging.error(f"Error encountered: {e}. Retrying entire pairing process after 3 seconds.")
+            child.close()
+            time.sleep(3)
+            # The loop will retry from the start.
+
+    logging.error("All overall pairing attempts failed.")
+    raise HTTPException(status_code=500, detail={"pairing": "failed"})
+
+
+
+
+#########################################################################
+# PROGRAM START POINT:
+
+
+if __name__ == "__main__":
+    print(BANNER)
+    
+    if any(arg in ("--help", "-h", "?") for arg in sys.argv[1:]):
+        print(HELP)
+        sys.exit(0)
+
+    uvicorn.run("moa_web_server:app", host="0.0.0.0", port=8080)
+

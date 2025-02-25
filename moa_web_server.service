@@ -1,0 +1,13 @@
+[Unit]
+Description=TERMA MOA Blue Web Server (port 8080)
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/moa_web_server
+ExecStart=/usr/bin/python3 /opt/moa_web_server/moa_web_server.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
