@@ -13,12 +13,16 @@
   "keywords": [
     "homebridge-plugin",
     "homebridge",
-    "TERMA",
-    "MOA"
+    "terma",
+    "moa",
+    "bluetooth",
+    "towel",
+    "heater",
+    "element"
   ],
   "license": "MIT",
   "main": "index.js",
-  "name": "homebridge-TERMA-MOA-Blue",
+  "name": "homebridge-terma-moa-blue",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/J1mbo/homebridge-TERMA-MOA-Blue.git"
@@ -27,7 +31,7 @@
     "type": "paypal",
     "url": "https://paypal.me/HomebridgeJ1mbo"
   },
-  "version": "0.0.1",
+  "version": "0.0.2",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   }
