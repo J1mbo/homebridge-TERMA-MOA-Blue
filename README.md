@@ -4,6 +4,8 @@
 
 A HomeBridge interface for the TERMA MOA Blue range of bluetooth enabled towel rail heating elements.
 
+Note: This plugin presents a thermostat to HomeKit. If this does not appear, try running this through a child bridge and adding that to Home.
+
 
 WARNING:
 
