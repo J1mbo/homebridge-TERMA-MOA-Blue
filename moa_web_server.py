@@ -100,6 +100,12 @@ Functions provided:
 ... (rest of help text omitted for brevity) ...
 """
 
+# Serve banner and help information when the root URL is requested.
+@app.get("/", response_class=PlainTextResponse)
+async def root():
+    return BANNER + "\n\n" + HELP
+
+
 # Terma specific UUIDs and temperature encode/decode
 ROOM_TEMP_UUID      = "d97352b1-d19e-11e2-9e96-0800200c9a66"  # For room temperature mode (mode 5)
 HEATER_TEMP_UUID    = "d97352b2-d19e-11e2-9e96-0800200c9a66"  # For heater temperature mode (mode 6)

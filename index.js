@@ -98,7 +98,13 @@ class ThermostatAccessory {
     this.targetTemperature = value;
     // Schedule heater update asynchronously.
     setImmediate(() => {
-      this.updateHeaterSetting();
+      if (this.roomTempSource === "DS18B20") {
+        // Use the feedback mechanism (Mode 6)
+        this.updateHeaterSetting();
+      } else {
+        // Use absolute HomeKit target (Mode 5)
+        this.sendHeaterUpdate(5, this.targetTemperature);
+      }
     });
     return;
   }
@@ -128,16 +134,12 @@ class ThermostatAccessory {
         this.sendHeaterUpdate(0, 0);
       }
     } else if (value === this.Characteristic.TargetHeatingCoolingState.HEAT) {
-      // If turning on, check the temperature source:
-      if (this.roomTempSource === "HeatingElement") {
-        // Use absolute HomeKit target (Mode 5)
-        this.sendHeaterUpdate(5, this.targetTemperature);
-      } else if (this.roomTempSource === "DS18B20") {
+      if (this.roomTempSource === "DS18B20") {
         // Use the feedback mechanism (Mode 6)
         this.updateHeaterSetting();
       } else {
-        // If unknown, default to DS18B20 feedback logic.
-        this.updateHeaterSetting();
+        // Use absolute HomeKit target (Mode 5)
+        this.sendHeaterUpdate(5, this.targetTemperature);
       }
     }
     return;
@@ -196,13 +198,12 @@ class ThermostatAccessory {
         if (json.room_temp_source) {
           this.roomTempSource = json.room_temp_source;
         }
-        // Control logic based on the temperature source:
-        if (this.roomTempSource === "HeatingElement") {
-          // Use Mode 5 with the absolute HomeKit target.
-          this.sendHeaterUpdate(5, this.targetTemperature);
-        } else if (this.roomTempSource === "DS18B20") {
-          // Use our feedback control mechanism.
+        if (this.roomTempSource === "DS18B20") {
+          // Use the feedback mechanism (Mode 6)
           this.updateHeaterSetting();
+        } else {
+          // Use absolute HomeKit target (Mode 5)
+          this.sendHeaterUpdate(5, this.targetTemperature);
         }
         // On successful polling, reset poll interval to 5 minutes if it was shortened.
         if (this.pollInterval !== 300000) {
@@ -220,9 +221,79 @@ class ThermostatAccessory {
       });
   }
 
+
+// updateHeaterSetting() recalculates the radiator temperature.
+// Used for DS18B20 (room temperature sensor) control.
+// A time and error based feedback mechanism adjusts the surface temperature to provide more accurate
+// room temperature conrtol without large swings. Full output is provided during the 'warm-up' phases.
+
+updateHeaterSetting() {
+    this.log.debug('updateHeaterSetting called');
+    const error = this.targetTemperature - this.currentRoomTemp;
+    let mode, desiredTarget, newRadiatorTarget;
+
+    // Polling interval in seconds.
+    const dt = this.pollInterval / 1000; // default is 300 seconds
+
+    // Compute derivative term: change in error over time.
+    if (this.lastError === undefined) {
+        this.lastError = error;
+    }
+    const deltaError = error - this.lastError;
+    this.lastError = error;
+
+    // Initialize and update the integral accumulator.
+    if (this.integralError === undefined) {
+        this.integralError = 0;
+    }
+    this.integralError += error;
+    
+    // Prevent integral windup by clamping the integral error.
+    const integralLimit = 10; // Tune as needed.
+    if (this.integralError > integralLimit) this.integralError = integralLimit;
+    if (this.integralError < -integralLimit) this.integralError = -integralLimit;
+
+    // Decide on control mode based on error.
+    if (error > 1) {
+        // If the room is more than 1°C below the target, use full output.
+        desiredTarget = 59;
+        mode = 6;
+        // Reset the integral term so previous accumulation doesn’t interfere.
+        this.integralError = 0;
+    } else {
+        // Near target: combine proportional, integral, and derivative control.
+        // These gains must be tuned based on the system’s response.
+        const Kp = 29;     // Proportional gain: a 1°C error maps to a 29°C boost (from a baseline of 30°C).
+        const Ki = 0.5;    // Integral gain: helps to overcome small, persistent errors.
+        const Kd = 5;      // Derivative gain: adjusts for how quickly the error is changing.
+        
+        const proportionalContribution = Kp * error;
+        const integralContribution = Ki * this.integralError;
+        // Derivative term is based on the rate of change (deltaError/dt).
+        const derivativeContribution = Kd * (deltaError / dt);
+        
+        desiredTarget = 30 + proportionalContribution + integralContribution + derivativeContribution;
+        // Clamp the target between the baseline (30°C) and full output (59°C).
+        desiredTarget = Math.min(Math.max(desiredTarget, 30), 59);
+        mode = 6;
+    }
+
+    // Since the heater's response is slow, we apply the calculated target directly.
+    newRadiatorTarget = desiredTarget;
+
+    // If the computed target is zero or below, turn off heating.
+    if (newRadiatorTarget <= 0) {
+        mode = 0;
+    }
+
+    this.log(`Calculated update: error = ${error.toFixed(1)}°C, desired target = ${desiredTarget.toFixed(1)}°C, new radiator target = ${newRadiatorTarget.toFixed(1)}°C, mode = ${mode}`);
+    this.sendHeaterUpdate(mode, newRadiatorTarget);
+}
+
+
   // Recalculate and set the radiator temperature.
   // For DS18B20 control, we use a feedback mechanism to gradually adjust the surface temperature.
-  updateHeaterSetting() {
+  updateHeaterSetting_old() {
     this.log.debug('updateHeaterSetting called');
     const error = this.targetTemperature - this.currentRoomTemp;
     let mode, desiredTarget, newRadiatorTarget;
