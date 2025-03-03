@@ -7,6 +7,7 @@ import asyncio
 import time
 import logging
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, validator
 from bleak import BleakClient, BleakScanner
 import uvicorn
@@ -97,7 +98,29 @@ Functions provided:
 /discover?timeout=XX.X
   Lists all devices and their associated addresses visible. If timeout is omitted uses 15s.
 
-... (rest of help text omitted for brevity) ...
+Because the sensor in the element is typically installed at floor level, this can result in low
+readings, for example in buildings with poor floor insulation. To solve this problem and enable more
+stable room temperature regulation across the seasons, the function automatically returns in
+room_current_temp the reading from the first attached Dallas DS18B20 sensor if present.
+
+When a DS18B20 sensor is present and working, room_temp_source will read "DS18B20".
+
+Note that when the heating element is set to room-temperature regulation mode (5), this depends
+ONLY on it's internal sensor. The purpose of the external sensor is to enable a controlling function
+to modulate the heater, for example using mode 6, to achieve better room temperature control and
+hence lower energy consumption.
+
+Note that the calls are slow:
+
+- 5-10 seconds to read values
+- 25-30 seconds to set a value
+- 10-60 seconds to pair
+
+Therefore any controlling function reporting onwards elsewhere, e.g. to HomeKit, should run
+asyncronously initially simply reporting success and subsequently updating HomeKit (in that case)
+with any issues later. Querying and updating the heating element once every 3-5 minutes is probably
+more than enough.
+
 """
 
 # Serve banner and help information when the root URL is requested.
